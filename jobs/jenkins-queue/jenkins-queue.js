@@ -1,53 +1,104 @@
-var querystring = require('querystring'),
+var util = require('util'),
     cache = require('memory-cache');
 
-module.exports = function(config, dependencies, job_callback) {
-    var credentials = config.credentials || 'jenkins';
+/**
+ * Job: jenkins-jobs
+ * 
+ * Configuration:
+ *  {
+ *      "interval": 10000,
+ *      "timeout" : 5000,
+ *      "endpoint": "url of the view, folder or root of jenkins",
+ *  }
+ */
 
-    var logger = dependencies.logger;
+module.exports = {
 
+    onRun: function(config, dependencies, job_callback) {
+        var credentials = config.credentials || 'jenkins';
+        config.credentials = credentials;
+
+        var logger = dependencies.logger;
+
+        var cache_expiration = config.interval; //ms
+        var cache_key = 'jenkins-buildqueue:config-' + JSON.stringify(config); // unique cache object per job config
+
+        if (cache.get(cache_key)) {
+            return job_callback(null, cache.get(cache_key));
+        }
+
+        fetchListOfJobs(config, dependencies)
+            .then(function(result) {
+                var data = result || {};
+
+                data = filterJobs(config, data);
+
+                cache.put(cache_key, data, cache_expiration);
+
+                job_callback(null, data);
+            }).catch(function(err) {
+                job_callback(err.message);
+            });
+    }
+};
+
+function generateRequestOptionsForJenkins(config) {
     var options = {
-        timeout: config.timeout || 15000,
-        url: config.endpoint + '/api/json?tree=jobs[name,url,color,inQueue]'
+        url: config.endpoint + '/api/json?tree=jobs[name,url,color,inQueue]',
+        timeout: config.timeout || 5000,
+        rejectUnauthorized: false
     };
 
-    if (config.globalAuth && config.globalAuth[credentials]) {
+    if (config.globalAuth && config.globalAuth[config.credentials]) {
         options.headers = {
-            "authorization": "Basic " + new Buffer(config.globalAuth[credentials].username + ":" +
-                config.globalAuth[credentials].password).toString("base64")
+            'authorization': 'Basic ' + new Buffer(
+                config.globalAuth[config.credentials].username +
+                ':' +
+                config.globalAuth[config.credentials].password
+            ).toString('base64')
         };
     }
 
-    var cache_expiration = 60 * 1000; //ms
-    var cache_key = 'jenkins-queue:config-' + JSON.stringify(config); // unique cache object per job config
-    if (cache.get(cache_key)) {
-        return job_callback(null, cache.get(cache_key));
-    }
+    return options;
+}
 
-    dependencies.easyRequest.JSON(options, function(error, viewData) {
-        if (error)
-            return job_callback(error);
+module.exports.fetchListOfJobs = fetchListOfJobs;
 
-        var result = {};
-
-        if (viewData) {
-            result = viewData;
-
-            if (result.jobs) {
-                var job = null;
-                for (var i = result.jobs.length - 1; i >= 0; i--) {
-                    job = result.jobs[i];
-                    if (!job.inQueue) {
-                        result.jobs.splice(i, 1);
+function fetchListOfJobs(config, dependencies) {
+    return new Promise(
+        function(resolve, reject) {
+            var options = generateRequestOptionsForJenkins(config);
+            dependencies.request(options, function(err, response, body) {
+                if (err) {
+                    reject(err);
+                } else if (!response) {
+                    reject(new Error('Bad response'));
+                } else if (response.statusCode !== 200) {
+                    reject(new Error(util.format('Bad status %s', response.statusCode)));
+                } else {
+                    try {
+                        var bodyObj = JSON.parse(body);
+                        resolve(bodyObj);
+                    } catch (ex) {
+                        reject(ex);
                     }
                 }
+            });
+        }
+    );
+}
+
+module.exports.filterJobs = filterJobs;
+
+function filterJobs(config, data) {
+    if (data.jobs) {
+        var job = null;
+        for (var i = data.jobs.length - 1; i >= 0; i--) {
+            job = data.jobs[i];
+            if (!job.inQueue) {
+                data.jobs.splice(i, 1);
             }
         }
-
-        var data = result;
-
-        cache.put(cache_key, data, cache_expiration);
-
-        job_callback(null, data);
-    });
-};
+    }
+    return data;
+}
